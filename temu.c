@@ -33,10 +33,10 @@
 #include <time.h>
 #include <getopt.h>
 #ifndef _WIN32
-#include <termios.h>
+//#include <termios.h>
 #include <sys/ioctl.h>
-#include <net/if.h>
-#include <linux/if_tun.h>
+//#include <net/if.h>
+//#include <linux/if_tun.h>
 #endif
 #include <sys/stat.h>
 #include <signal.h>
@@ -53,6 +53,25 @@
 #include "slirp/libslirp.h"
 #endif
 
+#ifdef WASI
+#include <wizer.h>
+#include "wasi.h"
+#endif
+
+extern char **environ;
+
+#ifdef ON_BROWSER
+#include <emscripten.h>
+#endif
+
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#ifndef ON_BROWSER
+// not defined in wasi-libc
+#define PF_INET 1
+#define PF_INET6 2
+#endif
+
 #ifndef _WIN32
 
 typedef struct {
@@ -61,48 +80,73 @@ typedef struct {
     BOOL resize_pending;
 } STDIODevice;
 
-static struct termios oldtty;
-static int old_fd0_flags;
-static STDIODevice *global_stdio_device;
+//static struct termios oldtty;
+//static int old_fd0_flags;
+//static STDIODevice *global_stdio_device;
+//
+//static void term_exit(void)
+//{
+//    tcsetattr (0, TCSANOW, &oldtty);
+//    fcntl(0, F_SETFL, old_fd0_flags);
+//}
+//
+//static void term_init(BOOL allow_ctrlc)
+//{
+//    struct termios tty;
+//
+//    memset(&tty, 0, sizeof(tty));
+//    tcgetattr (0, &tty);
+//    oldtty = tty;
+//    old_fd0_flags = fcntl(0, F_GETFL);
+//
+//    tty.c_iflag &= ~(IGNBRK|BRKINT|PARMRK|ISTRIP
+//                          |INLCR|IGNCR|ICRNL|IXON);
+//    tty.c_oflag |= OPOST;
+//    tty.c_lflag &= ~(ECHO|ECHONL|ICANON|IEXTEN);
+//    if (!allow_ctrlc)
+//        tty.c_lflag &= ~ISIG;
+//    tty.c_cflag &= ~(CSIZE|PARENB);
+//    tty.c_cflag |= CS8;
+//    tty.c_cc[VMIN] = 1;
+//    tty.c_cc[VTIME] = 0;
+//
+//    tcsetattr (0, TCSANOW, &tty);
+//
+//    atexit(term_exit);
+//}
 
-static void term_exit(void)
-{
-    tcsetattr (0, TCSANOW, &oldtty);
-    fcntl(0, F_SETFL, old_fd0_flags);
-}
+int init_start = FALSE;
+int init_done = FALSE;
 
-static void term_init(BOOL allow_ctrlc)
-{
-    struct termios tty;
-
-    memset(&tty, 0, sizeof(tty));
-    tcgetattr (0, &tty);
-    oldtty = tty;
-    old_fd0_flags = fcntl(0, F_GETFL);
-
-    tty.c_iflag &= ~(IGNBRK|BRKINT|PARMRK|ISTRIP
-                          |INLCR|IGNCR|ICRNL|IXON);
-    tty.c_oflag |= OPOST;
-    tty.c_lflag &= ~(ECHO|ECHONL|ICANON|IEXTEN);
-    if (!allow_ctrlc)
-        tty.c_lflag &= ~ISIG;
-    tty.c_cflag &= ~(CSIZE|PARENB);
-    tty.c_cflag |= CS8;
-    tty.c_cc[VMIN] = 1;
-    tty.c_cc[VTIME] = 0;
-
-    tcsetattr (0, TCSANOW, &tty);
-
-    atexit(term_exit);
-}
+#define INIT_STR_POS_MAX 10
+int init_str_pos = 0;
+char init_str_buf[INIT_STR_POS_MAX];
 
 static void console_write(void *opaque, const uint8_t *buf, int len)
 {
-    fwrite(buf, 1, len, stdout);
+    int off = 0;
+    if (!init_start) {
+      for (int i = 0; i < len; i++) {
+        if (buf[i] == '=') {
+          init_str_buf[init_str_pos++] = buf[i];
+          off++;
+          if (init_str_pos == INIT_STR_POS_MAX) {
+            // NOTE: init string isn't printed
+            init_start = TRUE;
+            break;
+          }
+        } else {
+          // flush all and reset counter
+          fwrite(init_str_buf, 1, init_str_pos, stdout);
+          init_str_pos = 0;
+        }
+      }
+    }
+    fwrite(buf+off, 1, len-off, stdout);
     fflush(stdout);
 }
 
-static int console_read(void *opaque, uint8_t *buf, int len)
+static int console_read_stdin(void *opaque, uint8_t *buf, int len)
 {
     STDIODevice *s = opaque;
     int ret, i, j;
@@ -152,35 +196,52 @@ static int console_read(void *opaque, uint8_t *buf, int len)
     return j;
 }
 
-static void term_resize_handler(int sig)
+const char *init_done_str = "=\n";
+int init_done_str_pos = 0;
+
+static int console_read(void *opaque, uint8_t *buf, int len)
 {
-    if (global_stdio_device)
-        global_stdio_device->resize_pending = TRUE;
+  if ((init_start) && (!init_done)) {
+    int l = min_int(strlen(init_done_str) - init_done_str_pos, len);
+    memcpy(buf, init_done_str + init_done_str_pos, l);
+    init_done_str_pos += l;
+    if (init_done_str_pos >= strlen(init_done_str)) {
+      init_done = TRUE;
+    }
+    return l;
+  }
+  return console_read_stdin(opaque, buf, len);
 }
+
+//static void term_resize_handler(int sig)
+//{
+//    if (global_stdio_device)
+//        global_stdio_device->resize_pending = TRUE;
+//}
 
 static void console_get_size(STDIODevice *s, int *pw, int *ph)
 {
-    struct winsize ws;
-    int width, height;
-    /* default values */
-    width = 80;
-    height = 25;
-    if (ioctl(s->stdin_fd, TIOCGWINSZ, &ws) == 0 &&
-        ws.ws_col >= 4 && ws.ws_row >= 4) {
-        width = ws.ws_col;
-        height = ws.ws_row;
-    }
-    *pw = width;
-    *ph = height;
+//  struct winsize ws;
+   int width, height;
+   /* default values */
+   width = 80;
+   height = 25;
+//  if (ioctl(s->stdin_fd, TIOCGWINSZ, &ws) == 0 &&
+//      ws.ws_col >= 4 && ws.ws_row >= 4) {
+//      width = ws.ws_col;
+//      height = ws.ws_row;
+//  }
+   *pw = width;
+   *ph = height;
 }
 
 CharacterDevice *console_init(BOOL allow_ctrlc)
 {
     CharacterDevice *dev;
     STDIODevice *s;
-    struct sigaction sig;
+    /* struct sigaction sig; */
 
-    term_init(allow_ctrlc);
+    //term_init(allow_ctrlc);
 
     dev = mallocz(sizeof(*dev));
     s = mallocz(sizeof(*s));
@@ -190,13 +251,13 @@ CharacterDevice *console_init(BOOL allow_ctrlc)
     fcntl(s->stdin_fd, F_SETFL, O_NONBLOCK);
 
     s->resize_pending = TRUE;
-    global_stdio_device = s;
+    //global_stdio_device = s;
     
     /* use a signal to get the host terminal resize events */
-    sig.sa_handler = term_resize_handler;
-    sigemptyset(&sig.sa_mask);
-    sig.sa_flags = 0;
-    sigaction(SIGWINCH, &sig, NULL);
+    //sig.sa_handler = term_resize_handler;
+    //sigemptyset(&sig.sa_mask);
+    //sig.sa_flags = 0;
+    //sigaction(SIGWINCH, &sig, NULL);
     
     dev->opaque = s;
     dev->write_data = console_write;
@@ -234,7 +295,6 @@ static int bf_read_async(BlockDevice *bs,
                          BlockDeviceCompletionFunc *cb, void *opaque)
 {
     BlockDeviceFile *bf = bs->opaque;
-    //    printf("bf_read_async: sector_num=%" PRId64 " n=%d\n", sector_num, n);
 #ifdef DUMP_BLOCK_READ
     {
         static FILE *f;
@@ -348,50 +408,50 @@ static BlockDevice *block_device_init(const char *filename,
 
 #ifndef _WIN32
 
-typedef struct {
-    int fd;
-    BOOL select_filled;
-} TunState;
-
-static void tun_write_packet(EthernetDevice *net,
-                             const uint8_t *buf, int len)
-{
-    TunState *s = net->opaque;
-    write(s->fd, buf, len);
-}
-
-static void tun_select_fill(EthernetDevice *net, int *pfd_max,
-                            fd_set *rfds, fd_set *wfds, fd_set *efds,
-                            int *pdelay)
-{
-    TunState *s = net->opaque;
-    int net_fd = s->fd;
-
-    s->select_filled = net->device_can_write_packet(net);
-    if (s->select_filled) {
-        FD_SET(net_fd, rfds);
-        *pfd_max = max_int(*pfd_max, net_fd);
-    }
-}
-
-static void tun_select_poll(EthernetDevice *net, 
-                            fd_set *rfds, fd_set *wfds, fd_set *efds,
-                            int select_ret)
-{
-    TunState *s = net->opaque;
-    int net_fd = s->fd;
-    uint8_t buf[2048];
-    int ret;
-    
-    if (select_ret <= 0)
-        return;
-    if (s->select_filled && FD_ISSET(net_fd, rfds)) {
-        ret = read(net_fd, buf, sizeof(buf));
-        if (ret > 0)
-            net->device_write_packet(net, buf, ret);
-    }
-    
-}
+//typedef struct {
+//    int fd;
+//    BOOL select_filled;
+//} TunState;
+//
+//static void tun_write_packet(EthernetDevice *net,
+//                             const uint8_t *buf, int len)
+//{
+//    TunState *s = net->opaque;
+//    write(s->fd, buf, len);
+//}
+//
+//static void tun_select_fill(EthernetDevice *net, int *pfd_max,
+//                            fd_set *rfds, fd_set *wfds, fd_set *efds,
+//                            int *pdelay)
+//{
+//    TunState *s = net->opaque;
+//    int net_fd = s->fd;
+//
+//    s->select_filled = net->device_can_write_packet(net);
+//    if (s->select_filled) {
+//        FD_SET(net_fd, rfds);
+//        *pfd_max = max_int(*pfd_max, net_fd);
+//    }
+//}
+//
+//static void tun_select_poll(EthernetDevice *net, 
+//                            fd_set *rfds, fd_set *wfds, fd_set *efds,
+//                            int select_ret)
+//{
+//    TunState *s = net->opaque;
+//    int net_fd = s->fd;
+//    uint8_t buf[2048];
+//    int ret;
+//    
+//    if (select_ret <= 0)
+//        return;
+//    if (s->select_filled && FD_ISSET(net_fd, rfds)) {
+//        ret = read(net_fd, buf, sizeof(buf));
+//        if (ret > 0)
+//            net->device_write_packet(net, buf, ret);
+//    }
+//    
+//}
 
 /* configure with:
 # bridge configuration (connect tap0 to bridge interface br0)
@@ -411,44 +471,44 @@ static void tun_select_poll(EthernetDevice *net,
    ifconfig eth0 192.168.3.2
    route add -net 0.0.0.0 netmask 0.0.0.0 gw 192.168.3.1
 */
-static EthernetDevice *tun_open(const char *ifname)
-{
-    struct ifreq ifr;
-    int fd, ret;
-    EthernetDevice *net;
-    TunState *s;
-    
-    fd = open("/dev/net/tun", O_RDWR);
-    if (fd < 0) {
-        fprintf(stderr, "Error: could not open /dev/net/tun\n");
-        return NULL;
-    }
-    memset(&ifr, 0, sizeof(ifr));
-    ifr.ifr_flags = IFF_TAP | IFF_NO_PI;
-    pstrcpy(ifr.ifr_name, sizeof(ifr.ifr_name), ifname);
-    ret = ioctl(fd, TUNSETIFF, (void *) &ifr);
-    if (ret != 0) {
-        fprintf(stderr, "Error: could not configure /dev/net/tun\n");
-        close(fd);
-        return NULL;
-    }
-    fcntl(fd, F_SETFL, O_NONBLOCK);
-
-    net = mallocz(sizeof(*net));
-    net->mac_addr[0] = 0x02;
-    net->mac_addr[1] = 0x00;
-    net->mac_addr[2] = 0x00;
-    net->mac_addr[3] = 0x00;
-    net->mac_addr[4] = 0x00;
-    net->mac_addr[5] = 0x01;
-    s = mallocz(sizeof(*s));
-    s->fd = fd;
-    net->opaque = s;
-    net->write_packet = tun_write_packet;
-    net->select_fill = tun_select_fill;
-    net->select_poll = tun_select_poll;
-    return net;
-}
+//static EthernetDevice *tun_open(const char *ifname)
+//{
+//    struct ifreq ifr;
+//    int fd, ret;
+//    EthernetDevice *net;
+//    TunState *s;
+//    
+//    fd = open("/dev/net/tun", O_RDWR);
+//    if (fd < 0) {
+//        fprintf(stderr, "Error: could not open /dev/net/tun\n");
+//        return NULL;
+//    }
+//    memset(&ifr, 0, sizeof(ifr));
+//    ifr.ifr_flags = IFF_TAP | IFF_NO_PI;
+//    pstrcpy(ifr.ifr_name, sizeof(ifr.ifr_name), ifname);
+//    ret = ioctl(fd, TUNSETIFF, (void *) &ifr);
+//    if (ret != 0) {
+//        fprintf(stderr, "Error: could not configure /dev/net/tun\n");
+//        close(fd);
+//        return NULL;
+//    }
+//    fcntl(fd, F_SETFL, O_NONBLOCK);
+//
+//    net = mallocz(sizeof(*net));
+//    net->mac_addr[0] = 0x02;
+//    net->mac_addr[1] = 0x00;
+//    net->mac_addr[2] = 0x00;
+//    net->mac_addr[3] = 0x00;
+//    net->mac_addr[4] = 0x00;
+//    net->mac_addr[5] = 0x01;
+//    s = mallocz(sizeof(*s));
+//    s->fd = fd;
+//    net->opaque = s;
+//    net->write_packet = tun_write_packet;
+//    net->select_fill = tun_select_fill;
+//    net->select_poll = tun_select_poll;
+//    return net;
+//}
 
 #endif /* !_WIN32 */
 
@@ -531,18 +591,288 @@ static EthernetDevice *slirp_open(void)
 
 #endif /* CONFIG_SLIRP */
 
+/*******************************************************/
+/* socket */
+
+typedef struct {
+    int fd;
+    BOOL select_filled;
+    char *raw_flag;
+
+    int tmpfd;
+    BOOL enabled;
+    int next_watch;
+    int retrynum;
+
+    uint32_t sizebuf;
+    int sizeoff;
+    int pktsize;
+    int pktoff;
+    uint8_t *pktbuf;
+} SocketState;
+
+static void socket_write_packet(EthernetDevice *net,
+                               const uint8_t *buf, int len)
+{
+    SocketState *s = net->opaque;
+    uint32_t size = htonl(len);
+    int ret;
+
+    if (s->fd < 0) {
+      return;
+    }
+
+    ret = send(s->fd, &size, 4, 0); // TODO: check error
+    if (ret < 0) {
+      close(s->fd);
+      s->fd = -1;
+      return;
+    }
+    ret = send(s->fd, buf, len, 0); // TODO: check error
+    if (ret < 0) {
+      close(s->fd);
+      s->fd = -1;
+      return;
+    }
+}
+
+static int try_get_fd(SocketState *s);
+
+static int socket_watch1(EthernetDevice *net)
+{
+  SocketState *s = (SocketState *)net->opaque;
+
+  if (!s->enabled)
+    return -1;
+
+  if (s->fd >= 0)
+    return 0;
+
+  s->next_watch--;
+  if (s->next_watch > 0)
+    return -1;
+  if (try_get_fd(s) >= 0)
+    return 0;
+  if (s->next_watch <= 0) {
+    s->next_watch = 500; // TODO: make it configable or should be time interval
+  }
+  
+  return -1;
+}
+
+static void socket_select_fill1(EthernetDevice *net, int *pfd_max,
+                               fd_set *rfds, fd_set *wfds, fd_set *efds,
+                               int *pdelay)
+{
+   SocketState *s = net->opaque;
+   int fd = s->fd;
+
+   if (s->fd < 0) {
+     return;
+   }
+
+   s->select_filled = net->device_can_write_packet(net);
+   if (s->select_filled) {
+       FD_SET(fd, rfds);
+       *pfd_max = max_int(*pfd_max, fd);
+   }
+}
+
+static void socket_select_poll1(EthernetDevice *net, 
+                               fd_set *rfds, fd_set *wfds, fd_set *efds,
+                               int select_ret)
+{
+   SocketState *s = net->opaque;
+   int fd = s->fd;
+   uint32_t size = 0;
+   int ret;
+   
+   if (s->fd < 0) {
+     return;
+   }
+
+   if (select_ret <= 0)
+       return;
+
+   if (s->select_filled && FD_ISSET(fd, rfds)) {
+     if (s->pktsize <= 0) {
+       while (s->sizeoff < 4) {
+         ret = recv(fd, &s->sizebuf + s->sizeoff, 4 - s->sizeoff, 0);
+         if (ret <= 0) {
+           if (errno == EAGAIN)
+             return; // try later
+           close(s->fd);
+           s->fd = -1; // invalid fd. hopefully the watch loop will recover this.
+           return;
+         }
+         s->sizeoff += ret;
+       }
+       s->pktsize = ntohl(s->sizebuf);
+       s->sizeoff = 0;
+       s->sizebuf = 0;
+     }
+
+     if (s->pktsize > 0) {
+       size = s->pktsize;
+       if (s->pktbuf == NULL) {
+         s->pktoff = 0;
+         s->pktbuf = (uint8_t *)mallocz(size); // TODO: make limit
+       }
+       while (s->pktoff < size) {
+         ret = recv(fd, s->pktbuf + s->pktoff, size - s->pktoff, 0);
+         if (ret <= 0) {
+           if (errno == EAGAIN)
+             return; // try later
+           close(s->fd);
+           s->fd = -1; // invalid fd. hopefully the watch loop will recover this.
+           return;
+         }
+         s->pktoff += ret;
+       }
+       net->device_write_packet(net, s->pktbuf, size);
+       free(s->pktbuf);
+       s->pktbuf = NULL;
+       s->pktsize = 0;
+       s->pktoff = 0;
+     }
+   }
+}
+
+static EthernetDevice *socket_net_init()
+{
+    EthernetDevice *net;
+    SocketState *s;
+
+    net = mallocz(sizeof(*net));
+    net->mac_addr[0] = 0x02;
+    net->mac_addr[1] = 0x00;
+    net->mac_addr[2] = 0x00;
+    net->mac_addr[3] = 0x00;
+    net->mac_addr[4] = 0x00;
+    net->mac_addr[5] = 0x01;
+    net->opaque = NULL;
+    s = mallocz(sizeof(*s));
+    s->fd = -1;
+    s->tmpfd = -1;
+    s->enabled = FALSE;
+    s->next_watch = 0;
+    net->opaque = s;
+    net->write_packet = socket_write_packet;
+    net->select_fill = socket_select_fill1;
+    net->select_poll = socket_select_poll1;
+    net->watch = socket_watch1;
+
+    return net;
+}
+
+static void reset_socket_socket_state(SocketState *s)
+{
+    s->sizebuf = 0;
+    s->sizeoff = 0;
+    s->pktsize = 0;
+    s->pktoff = 0;
+    if (s->pktbuf != NULL) {
+      free(s->pktbuf);
+    }
+    s->pktbuf = NULL;
+}
+
+#ifdef ON_BROWSER
+static int try_get_fd(SocketState *s)
+{
+    int sock= s->fd;
+    fd_set wfds;
+    struct sockaddr_in socketAddr;
+
+    if (s->tmpfd < 0) {
+      if ((sock = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP)) < 0) {
+        printf("failed to prepare socket: %s\n", strerror(errno));
+        return -1;
+      }
+      // connect to the network stack
+      memset(&socketAddr, 0, sizeof(socketAddr));
+      socketAddr.sin_family = AF_INET;
+      int cret = connect(sock, (struct sockaddr *) &socketAddr, sizeof(socketAddr));
+      BOOL connected = FALSE;
+      if ((cret == 0) || (errno == EISCONN)) {
+        /* printf("socket connected\n"); */
+        s->fd = sock;
+        s->tmpfd = -1;
+        reset_socket_socket_state(s);
+        return 0;
+      } else if (errno != EINPROGRESS) {
+        printf("failed to connect: %s\n", strerror(errno));
+        s->fd = -1;
+        s->tmpfd = -1;
+        return -1;
+      }
+      s->retrynum = 0;
+      s->tmpfd = sock;
+    }
+
+    /* printf("waiting for connection...\n"); */
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 0;
+    FD_ZERO(&wfds);
+    FD_SET(s->tmpfd, &wfds);
+    int sret = select(s->tmpfd + 1, NULL, &wfds, NULL, &tv);
+    if (sret > 0) {
+      s->fd = s->tmpfd;
+      s->tmpfd = -1;
+      reset_socket_socket_state(s);
+      return 0;
+    } else if (sret < 0) {
+      s->fd = -1;
+      s->tmpfd = -1;
+    } // else, still wait for the connection.
+    /* printf("select result: %d\n", sret); */
+
+    s->retrynum++;
+    if (s->retrynum > 5) { // TODO: make max retry number configurable
+      close(s->tmpfd);
+      s->tmpfd = -1; // too many errors. retry connection.
+    }
+
+    return -1;
+}
+#elif defined(WASI)
+static int try_get_fd(SocketState *s)
+{
+  int sock = 3;
+  if ((s->raw_flag != NULL) && (!strncmp(s->raw_flag, "socket=", 7))) {
+    // TODO: allow specifying more options
+    if (!strncmp(s->raw_flag + 7, "listenfd=", 9)) {
+      sock = atoi(s->raw_flag + 7 + 9);
+    }
+  }
+  int sock_a = 0;
+  // wait for connection
+  /* printf("accept trying...(sockfd=%d)\n", sock); */
+  sock_a = accept4(sock, NULL, NULL, SOCK_NONBLOCK);
+  if (sock_a > 0) {
+    /* printf("accepted fd=%d\n", sock_a); */
+    s->fd = sock_a;
+    reset_socket_socket_state(s);
+    return 0;
+  }
+  /* printf("failed to accept socket: %s\n", strerror(errno)); */
+  return -1;
+}
+#endif
+
 #define MAX_EXEC_CYCLE 500000
 #define MAX_SLEEP_TIME 10 /* in ms */
 
-void virt_machine_run(VirtMachine *m)
+void virt_machine_run(VirtMachine *m, int enable_stdin)
 {
     fd_set rfds, wfds, efds;
-    int fd_max, ret, delay;
+    int fd_max, ret = 0, delay;
     struct timeval tv;
 #ifndef _WIN32
     int stdin_fd;
 #endif
-    
+
     delay = virt_machine_get_sleep_duration(m, MAX_SLEEP_TIME);
     
     /* wait for an event */
@@ -551,7 +881,7 @@ void virt_machine_run(VirtMachine *m)
     FD_ZERO(&efds);
     fd_max = -1;
 #ifndef _WIN32
-    if (m->console_dev && virtio_console_can_write_data(m->console_dev)) {
+    if (enable_stdin && m->console_dev && virtio_console_can_write_data(m->console_dev)) {
         STDIODevice *s = m->console->opaque;
         stdin_fd = s->stdin_fd;
         FD_SET(stdin_fd, &rfds);
@@ -565,28 +895,44 @@ void virt_machine_run(VirtMachine *m)
         }
     }
 #endif
+    fd_set n_rfds, n_wfds, n_efds;
+    FD_ZERO(&n_rfds);
+    FD_ZERO(&n_wfds);
+    FD_ZERO(&n_efds);
+    int n_fd_max = -1;
     if (m->net) {
-        m->net->select_fill(m->net, &fd_max, &rfds, &wfds, &efds, &delay);
+      m->net->select_fill(m->net, &n_fd_max, &n_rfds, &n_wfds, &n_efds, &delay);
     }
 #ifdef CONFIG_FS_NET
-    fs_net_set_fdset(&fd_max, &rfds, &wfds, &efds, &delay);
+    fs_net_set_fdset(&n_fd_max, &n_rfds, &n_wfds, &n_efds, &delay);
 #endif
     tv.tv_sec = delay / 1000;
     tv.tv_usec = (delay % 1000) * 1000;
-    ret = select(fd_max + 1, &rfds, &wfds, &efds, &tv);
+#ifdef ON_BROWSER
+    // no timeout; TODO: remove this when sleep supports timeout
+    tv.tv_sec = 0;
+    tv.tv_usec = 0;
+#endif
+    if (enable_stdin && init_done)
+        ret = select(fd_max + 1, &rfds, &wfds, NULL, &tv);
     if (m->net) {
-        m->net->select_poll(m->net, &rfds, &wfds, &efds, ret);
+      if (n_fd_max >= 0) {
+        // TODO: select should be unified (stdin + net), but it doesn't work as of now.
+        int n_ret = select(n_fd_max + 1, &n_rfds, &n_wfds, NULL, &tv);
+        m->net->select_poll(m->net, &n_rfds, &n_wfds, &n_efds, n_ret);
+      }
+      m->net->watch(m->net);
     }
-    if (ret > 0) {
+    if ((ret > 0) || (init_start && !init_done)) {
 #ifndef _WIN32
-        if (m->console_dev && FD_ISSET(stdin_fd, &rfds)) {
+        if (m->console_dev && (FD_ISSET(stdin_fd, &rfds) || (init_start && !init_done))) {
             uint8_t buf[128];
             int ret, len;
             len = virtio_console_get_write_len(m->console_dev);
             len = min_int(len, sizeof(buf));
             ret = m->console->read_data(m->console->opaque, buf, len);
             if (ret > 0) {
-                virtio_console_write_data(m->console_dev, buf, ret);
+              virtio_console_write_data(m->console_dev, buf, ret);
             }
         }
 #endif
@@ -596,6 +942,9 @@ void virt_machine_run(VirtMachine *m)
     sdl_refresh(m);
 #endif
     
+#ifdef ON_BROWSER
+    emscripten_sleep(delay);
+#endif
     virt_machine_interp(m, MAX_EXEC_CYCLE);
 }
 
@@ -603,30 +952,37 @@ void virt_machine_run(VirtMachine *m)
 
 static struct option options[] = {
     { "help", no_argument, NULL, 'h' },
-    { "ctrlc", no_argument },
-    { "rw", no_argument },
-    { "ro", no_argument },
-    { "append", required_argument },
-    { "no-accel", no_argument },
-    { "build-preload", required_argument },
+    { "no-stdin", no_argument },
+    { "entrypoint", required_argument },
+    { "net", required_argument },
+    { "mac", required_argument },
+    { "external-bundle", required_argument },
+// The following flags are unsupported as of now:
+//    { "ctrlc", no_argument },
+//    { "rw", no_argument },
+//    { "ro", no_argument },
+//    { "append", required_argument },
+//    { "no-accel", no_argument },
+//    { "build-preload", required_argument },
     { NULL },
 };
 
 void help(void)
 {
-    printf("temu version " CONFIG_VERSION ", Copyright (c) 2016-2018 Fabrice Bellard\n"
-           "usage: riscvemu [options] config_file\n"
-           "options are:\n"
-           "-m ram_size       set the RAM size in MB\n"
-           "-rw               allow write access to the disk image (default=snapshot)\n"
-           "-ctrlc            the C-c key stops the emulator instead of being sent to the\n"
-           "                  emulated software\n"
-           "-append cmdline   append cmdline to the kernel command line\n"
-           "-no-accel         disable VM acceleration (KVM, x86 machine only)\n"
-           "\n"
-           "Console keys:\n"
-           "Press C-a x to exit the emulator, C-a h to get some help.\n");
-    exit(1);
+   printf("USAGE: command [options] [COMMAND] [ARG...] \n"
+          "  [COMMAND] [ARG...]: command to run in the container. (default: commands specified in the image config)\n"
+          "\n"
+          "OPTIONS:\n"
+          "  -entrypoint <command>     : entrypoint command. (default: entrypoint specified in the image config)\n"
+          "  -no-stdin                 : disable stdin. (default: false)\n"
+          "  -net <mode>               : enable networking with the specified mode (default: disabled. supported mode: \"socket\")\n"
+          "  -mac <mac address>        : use a custom mac address for the VM\n"
+          "  -external-bundle <address>: externally mount container bundle\n"
+          "\n"
+          "This tool is based on:\n"
+          "temu version 2019-12-21, Copyright (c) 2016-2018 Fabrice Bellard\n"
+          );
+   exit(0);
 }
 
 #ifdef CONFIG_FS_NET
@@ -644,68 +1000,22 @@ static BOOL net_poll_cb(void *arg)
 
 #endif
 
-int main(int argc, char **argv)
+FSVirtFile *info;
+int initialized = FALSE;
+VirtMachine *s;
+VirtMachineParams p_s, *p = &p_s;
+
+void init_func_args(char *net)
 {
-    VirtMachine *s;
-    const char *path, *cmdline, *build_preload_file;
-    int c, option_index, i, ram_size, accel_enable;
-    BOOL allow_ctrlc;
-    BlockDeviceModeEnum drive_mode;
-    VirtMachineParams p_s, *p = &p_s;
+    const char *path, *cmdline = NULL;
+    int i = 0;
+    int ram_size = -1;
+    int accel_enable = -1; // TODO: make it overwritable
+    BOOL allow_ctrlc = FALSE; // TODO: make it overwritable
+    BlockDeviceModeEnum drive_mode = BF_MODE_SNAPSHOT; // TODO: make it overwritable
+    FSDevice *fs;
 
-    ram_size = -1;
-    allow_ctrlc = FALSE;
-    (void)allow_ctrlc;
-    drive_mode = BF_MODE_SNAPSHOT;
-    accel_enable = -1;
-    cmdline = NULL;
-    build_preload_file = NULL;
-    for(;;) {
-        c = getopt_long_only(argc, argv, "hm:", options, &option_index);
-        if (c == -1)
-            break;
-        switch(c) {
-        case 0:
-            switch(option_index) {
-            case 1: /* ctrlc */
-                allow_ctrlc = TRUE;
-                break;
-            case 2: /* rw */
-                drive_mode = BF_MODE_RW;
-                break;
-            case 3: /* ro */
-                drive_mode = BF_MODE_RO;
-                break;
-            case 4: /* append */
-                cmdline = optarg;
-                break;
-            case 5: /* no-accel */
-                accel_enable = FALSE;
-                break;
-            case 6: /* build-preload */
-                build_preload_file = optarg;
-                break;
-            default:
-                fprintf(stderr, "unknown option index: %d\n", option_index);
-                exit(1);
-            }
-            break;
-        case 'h':
-            help();
-            break;
-        case 'm':
-            ram_size = strtoul(optarg, NULL, 0);
-            break;
-        default:
-            exit(1);
-        }
-    }
-
-    if (optind >= argc) {
-        help();
-    }
-
-    path = argv[optind++];
+    path = "/pack/config"; // default location
 
     virt_machine_set_defaults(p);
 #ifdef CONFIG_FS_NET
@@ -717,7 +1027,6 @@ int main(int argc, char **argv)
 #endif
 
     /* override some config parameters */
-
     if (ram_size > 0) {
         p->ram_size = (uint64_t)ram_size << 20;
     }
@@ -726,7 +1035,7 @@ int main(int argc, char **argv)
     if (cmdline) {
         vm_add_cmdline(p, cmdline);
     }
-    
+
     /* open the files & devices */
     for(i = 0; i < p->drive_count; i++) {
         BlockDevice *drive;
@@ -748,38 +1057,36 @@ int main(int argc, char **argv)
         p->tab_drive[i].block_dev = drive;
     }
 
-    for(i = 0; i < p->fs_count; i++) {
-        FSDevice *fs;
-        const char *path;
-        path = p->tab_fs[i].filename;
-#ifdef CONFIG_FS_NET
-        if (is_url(path)) {
-            fs = fs_net_init(path, NULL, NULL);
-            if (!fs)
-                exit(1);
-            if (build_preload_file)
-                fs_dump_cache_load(fs, build_preload_file);
-            fs_net_event_loop(NULL, NULL);
-        } else
-#endif
-        {
-#ifdef _WIN32
-            fprintf(stderr, "Filesystem access not supported yet\n");
-            exit(1);
-#else
-            char *fname;
-            fname = get_file_path(p->cfg_filename, path);
-            fs = fs_disk_init(fname);
-            if (!fs) {
-                fprintf(stderr, "%s: must be a directory\n", fname);
-                exit(1);
-            }
-            free(fname);
-#endif
-        }
-        p->tab_fs[i].fs_dev = fs;
+    // fs "wasi0" is root directory (preopend paths are only accessible)
+    p->fs_count = 0;
+    fs = fs_disk_init("");
+    if (!fs) {
+      fprintf(stderr, "/: must be a directory\n");
+      exit(1);
     }
+    p->tab_fs[p->fs_count].fs_dev = fs;
+    if (asprintf(&(p->tab_fs[p->fs_count].tag), "wasi%d", p->fs_count) < 0) {
+      exit(1);
+    }
+    p->fs_count++;
 
+    // fs "wasi1" is "pack" directory
+    info = malloc(sizeof(FSVirtFile));
+    info->contents = mallocz(1024);
+    info->len = 0;
+    info->lim = 1024;
+    fs = fs_disk_init_with_info("pack", "info", info);
+    if (!fs) {
+      fprintf(stderr, "cannot prepare pack fs %s\n", strerror(errno));
+      exit(1);
+    }
+    p->tab_fs[p->fs_count].fs_dev = fs;
+    if (asprintf(&(p->tab_fs[p->fs_count].tag), "wasi%d", p->fs_count) < 0) {
+      exit(1);
+    }
+    p->fs_count++;
+
+    // networking
     for(i = 0; i < p->eth_count; i++) {
 #ifdef CONFIG_SLIRP
         if (!strcmp(p->tab_eth[i].driver, "user")) {
@@ -790,9 +1097,10 @@ int main(int argc, char **argv)
 #endif
 #ifndef _WIN32
         if (!strcmp(p->tab_eth[i].driver, "tap")) {
-            p->tab_eth[i].net = tun_open(p->tab_eth[i].ifname);
-            if (!p->tab_eth[i].net)
-                exit(1);
+// TODO
+//            p->tab_eth[i].net = tun_open(p->tab_eth[i].ifname);
+//            if (!p->tab_eth[i].net)
+//                exit(1);
         } else
 #endif
         {
@@ -800,6 +1108,15 @@ int main(int argc, char **argv)
                     p->tab_eth[i].driver);
             exit(1);
         }
+    }
+
+    if ((p->eth_count == 0) && (net != NULL)) {
+      if (!strncmp(net, "socket", 6)) {
+           p->tab_eth[0].net = socket_net_init();
+           p->eth_count++;
+           if (!p->tab_eth[0].net)
+               exit(1);
+      }
     }
     
 #ifdef CONFIG_SDL
@@ -820,16 +1137,334 @@ int main(int argc, char **argv)
     s = virt_machine_init(p);
     if (!s)
         exit(1);
-    
-    virt_machine_free_config(p);
 
     if (s->net) {
         s->net->device_set_carrier(s->net, TRUE);
     }
-    
+
     for(;;) {
-        virt_machine_run(s);
+        virt_machine_run(s, FALSE);
+        if (init_start)
+          break;
     }
+
+    for(i = 0; i < p->drive_count; i++) {
+      BlockDeviceFile *bf = p->tab_drive[i].block_dev->opaque;
+      fclose(bf->f);
+    }
+    initialized = TRUE;
+}
+
+void init_func()
+{
+    init_func_args("socket");
+}
+
+#ifdef WASI
+WIZER_INIT(init_func);
+#endif
+
+int write_entrypoint(FSVirtFile *f, int pos1, const char *entrypoint)
+{
+  int p, pos = pos1;
+
+  p = write_info(f, pos, 3, "e: ");
+  if (p < 0) {
+    return -1;
+  }
+  pos += p;
+  for (int j = 0; j < strlen(entrypoint); j++) {
+    if (entrypoint[j] == '\n') {
+      p = write_info(f, pos, 2, "\\\n");
+      if (p != 2) {
+        return -1;
+      }
+      pos += p;
+      continue;
+    }
+    if (putchar_info(f, pos++, entrypoint[j]) != 1) {
+      return -1;
+    }
+  }
+  if (putchar_info(f, pos++, '\n') != 1) {
+    return -1;
+  }
+  return pos - pos1;
+}
+
+int write_args(FSVirtFile *f, int argc, char **argv, int optind, int pos1)
+{
+  int p, pos = pos1;
+
+  p = write_info(f, pos, 3, "c: ");
+  if (p < 0) {
+    return -1;
+  }
+  pos += p;
+  int written = FALSE;
+  for (int i = optind; i < argc; i++) {
+    for (int j = 0; j < strlen(argv[i]); j++) {
+      if ((argv[i][j] == ' ') || (argv[i][j] == '\n')) {
+        if (putchar_info(f, pos++, '\\') != 1) {
+          return -1;
+        }
+      }
+      if (putchar_info(f, pos++, argv[i][j]) != 1) {
+        return -1;
+      }
+    }
+    if (putchar_info(f, pos++, ' ') != 1) {
+      return -1;
+    }
+    written = TRUE;
+  }
+  if (written) {
+    // remove the last space and use newline instead
+    if (putchar_info(f, pos-1, '\n') != 1) {
+      return -1;
+    }
+  }
+  return pos - pos1;
+}
+
+int write_env(FSVirtFile *f, int pos1, const char *env)
+{
+  int p, pos = pos1;
+
+  p = write_info(f, pos, 5, "env: ");
+  if (p < 0) {
+    return -1;
+  }
+  pos += p;
+  for (int j = 0; j < strlen(env); j++) {
+    if (env[j] == '\n') {
+      p = write_info(f, pos, 2, "\\\n");
+      if (p != 2) {
+        return -1;
+      }
+      pos += p;
+      continue;
+    }
+    if (putchar_info(f, pos++, env[j]) != 1) {
+      return -1;
+    }
+  }
+  if (putchar_info(f, pos++, '\n') != 1) {
+    return -1;
+  }
+  return pos - pos1;
+}
+
+int write_net(FSVirtFile *f, int pos1, const char *mac)
+{
+  int p, pos = pos1;
+
+  p = write_info(f, pos, 3, "n: ");
+  if (p < 0) {
+    return -1;
+  }
+  pos += p;
+  for (int j = 0; j < strlen(mac); j++) {
+    if (putchar_info(f, pos++, mac[j]) != 1) {
+      return -1;
+    }
+  }
+  if (putchar_info(f, pos++, '\n') != 1) {
+    return -1;
+  }
+  return pos - pos1;
+}
+
+int write_bundle(FSVirtFile *f, int pos1, const char *bundle)
+{
+  int p, pos = pos1;
+
+  p = write_info(f, pos, 3, "b: ");
+  if (p < 0) {
+    return -1;
+  }
+  pos += p;
+  for (int j = 0; j < strlen(bundle); j++) {
+    if (putchar_info(f, pos++, bundle[j]) != 1) {
+      return -1;
+    }
+  }
+  if (putchar_info(f, pos++, '\n') != 1) {
+    return -1;
+  }
+  return pos - pos1;
+}
+
+int write_time(FSVirtFile *f, int pos1, const char *timestr)
+{
+  int p, pos = pos1;
+
+  p = write_info(f, pos, 3, "t: ");
+  if (p < 0) {
+    return -1;
+  }
+  pos += p;
+  for (int j = 0; j < strlen(timestr); j++) {
+    if (putchar_info(f, pos++, timestr[j]) != 1) {
+      return -1;
+    }
+  }
+  if (putchar_info(f, pos++, '\n') != 1) {
+    return -1;
+  }
+  return pos - pos1;
+}
+
+int main(int argc, char **argv)
+{
+#ifdef WASI
+    if (init_wasi() != 0) {
+      fprintf(stderr, "failed to initialize for wasi");
+      exit(1);
+    }
+#endif
+
+    /* const char *cmdline, *build_preload_file; */
+    char *entrypoint = NULL, *net = NULL, *mac = NULL, *bundle = NULL;
+    int pos, c, option_index, i, enable_stdin = TRUE;
+    for(;;) {
+        c = getopt_long_only(argc, argv, "+h", options, &option_index);
+        if (c == -1)
+            break;
+        switch(c) {
+        case 0:
+            switch(option_index) {
+            case 0: /* help */
+                help();
+                break;
+            case 1: /* no-stdin */
+                enable_stdin = FALSE;
+                break;
+            case 2: /* entrypoint */
+                entrypoint = optarg;
+                break;
+            case 3: /* net */
+                net = optarg;
+                break;
+            case 4: /* mac */
+                mac = optarg;
+                break;
+            case 5: /* external-bundle */
+                bundle = optarg;
+                break;
+            default:
+                fprintf(stderr, "unknown option index: %d\n", option_index);
+                exit(1);
+            }
+            break;
+        case 'h':
+            help();
+            break;
+        default:
+            exit(1);
+        }
+    }
+
+    if (!initialized) {
+      init_func_args(net);
+    } else {
+      virt_machine_resume(s);
+    }
+
+    pos = info->len;
+    if (entrypoint) {
+      int p = write_entrypoint(info, pos, entrypoint);
+      if (p < 0) {
+        printf("failed to prepare entrypoint info\n");
+        exit(1);
+      }
+      pos += p;
+    }
+    
+    if (optind < argc) {
+      int p = write_args(info, argc, argv, optind, pos);
+      if (p < 0) {
+        printf("failed to prepare entrypoint info\n");
+        exit(1);
+      }
+      pos += p;
+    }
+
+#ifdef WASI
+    // TODO: support emscripten; it seems some default variables are passed, which shouldn't be inherited by the container.
+    // https://github.com/emscripten-core/emscripten/blob/0566a76b500bd2bbd535e108f657fce1db7f6f75/src/library_wasi.js#L62
+    for (char **env = environ; *env; ++env) {
+      int p = write_env(info, pos, *env);
+      if (p < 0) {
+        printf("failed to prepare env info\n");
+        exit(1);
+      }
+      pos += p;
+    }
+#endif
+
+    if (net) {
+      if (!strncmp(net, "socket", 6)) {
+        EthernetDevice *netd;
+        for(i = 0; i < p->eth_count; i++) {
+          netd = p->tab_eth[i].net;
+          if (netd != NULL) {
+            ((SocketState *)netd->opaque)->enabled = TRUE;
+            ((SocketState *)netd->opaque)->raw_flag = net;
+          }
+        }
+      }
+      int p = write_net(info, pos, mac);
+      if (p < 0) {
+        printf("failed to prepare net info\n");
+        exit(1);
+      }
+      pos += p;
+    }
+
+    if (bundle != NULL) {
+      int p = write_bundle(info, pos, bundle);
+      if (p < 0) {
+        printf("failed to prepare net info\n");
+        exit(1);
+      }
+      pos += p;
+    }
+
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%d", (unsigned)time(NULL));
+    int ps = write_time(info, pos, buf);
+    if (ps < 0) {
+      printf("failed to prepare time info\n");
+      exit(1);
+    }
+    pos += ps;
+
+    info->len = pos;
+#ifdef WASI
+    info->len += write_preopen_info(info, pos);
+#endif
+
+    // reopen drive files as we can't use stale file descriptors registered during initialize.
+    for(i = 0; i < p->drive_count; i++) {
+        FILE *f;
+        BlockDeviceFile *bf = p->tab_drive[i].block_dev->opaque;
+        char *fname;
+        fname = get_file_path(p->cfg_filename, p->tab_drive[i].filename);
+        f = fopen(fname, "rb");
+        if (!f) {
+          fprintf(stderr, "failed to open %s: %s\n", fname, strerror(errno));
+          exit(1);
+        }
+        bf->f = f;
+        p->tab_drive[i].block_dev->opaque = bf;
+    }
+    virt_machine_free_config(p);
+
+    for(;;) {
+      virt_machine_run(s, enable_stdin);
+    }
+
     virt_machine_end(s);
     return 0;
 }

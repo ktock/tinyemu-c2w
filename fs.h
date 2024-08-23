@@ -80,16 +80,17 @@
 #define P9_SETATTR_ATIME_SET 0x00000080
 #define P9_SETATTR_MTIME_SET 0x00000100
 
-#define P9_EPERM     1
-#define P9_ENOENT    2
-#define P9_EIO       5
-#define	P9_EEXIST    17
-#define	P9_ENOTDIR   20
-#define P9_EINVAL    22
-#define	P9_ENOSPC    28
-#define P9_ENOTEMPTY 39
-#define P9_EPROTO    71
-#define P9_ENOTSUP   524
+#define P9_EPERM      1
+#define P9_ENOENT     2
+#define P9_EIO        5
+#define P9_EEXIST     17
+#define P9_ENOTDIR    20
+#define P9_EINVAL     22
+#define P9_ENOSPC     28
+#define P9_ENOTEMPTY  39
+#define P9_EPROTO     71
+#define P9_EOPNOTSUPP 95
+#define P9_ENOTSUP    524
 
 typedef struct FSDevice FSDevice;
 typedef struct FSFile FSFile;
@@ -193,7 +194,17 @@ struct FSDevice {
     int (*fs_getlock)(FSDevice *fs, FSFile *f, FSLock *lock);
 };
 
+typedef struct {
+  char *contents;
+  int len;
+  int lim;
+} FSVirtFile;
+
+int write_info(FSVirtFile *f, int pos, int len, const char *str);
+int putchar_info(FSVirtFile *f, int pos, char c);
+
 FSDevice *fs_disk_init(const char *root_path);
+FSDevice *fs_disk_init_with_info(const char *root_path, const char *info_path, FSVirtFile *info);
 FSDevice *fs_mem_init(void);
 FSDevice *fs_net_init(const char *url, void (*start)(void *opaque), void *opaque);
 void fs_net_set_pwd(FSDevice *fs, const char *pwd);

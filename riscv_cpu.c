@@ -644,8 +644,8 @@ static void glue(riscv_cpu_flush_tlb_write_range_ram,
                       MSTATUS_FS | \
                       MSTATUS_MPRV | MSTATUS_SUM | MSTATUS_MXR)
 
-/* cycle and insn counters */
-#define COUNTEREN_MASK ((1 << 0) | (1 << 2))
+/* cycle, insn and time counters */
+#define COUNTEREN_MASK ((1 << 0) | (1 << 2) | (1 << 1))
 
 /* return the complete mstatus with the SD bit */
 static target_ulong get_mstatus(RISCVCPUState *s, target_ulong mask)

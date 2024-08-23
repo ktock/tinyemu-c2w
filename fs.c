@@ -102,3 +102,25 @@ void fs_end(FSDevice *fs)
     fs->fs_end(fs);
     free(fs);
 }
+
+int write_info(FSVirtFile *f, int pos, int len, const char *str)
+{
+  if ((pos + len) > f->lim) {
+    printf("too many write (%d > %d)", pos + len, f->lim);
+    return -1;
+  }
+  for (int i = 0; i < len; i++) {
+    f->contents[pos + i] = str[i];
+  }
+  return len;
+}
+
+int putchar_info(FSVirtFile *f, int pos, char c)
+{
+  if ((pos + 1) > f->lim) {
+    printf("too many write (%d > %d)", pos + 1, f->lim);
+    return -1;
+  }
+  f->contents[pos] = c;
+  return 1;
+}

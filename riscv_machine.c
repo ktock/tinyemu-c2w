@@ -87,11 +87,19 @@ static uint64_t rtc_get_real_time(RISCVMachine *s)
         (ts.tv_nsec / (1000000000 / RTC_FREQ));
 }
 
+int needs_adjust_real_time = FALSE;
+uint64_t last_real_time = 0;
+
 static uint64_t rtc_get_time(RISCVMachine *m)
 {
     uint64_t val;
     if (m->rtc_real_time) {
         val = rtc_get_real_time(m) - m->rtc_start_time;
+        if (needs_adjust_real_time) {
+          val += last_real_time;
+        } else {
+          last_real_time = val;
+        }
     } else {
         val = riscv_cpu_get_cycles(m->cpu_state) / RTC_FREQ_DIV;
     }
@@ -134,12 +142,12 @@ static void htif_handle_cmd(RISCVMachine *s)
     cmd = (s->htif_tohost >> 48) & 0xff;
     if (s->htif_tohost == 1) {
         /* shuthost */
-        printf("\nPower off.\n");
+        //printf("\nPower off.\n");
         exit(0);
     } else if (device == 1 && cmd == 1) {
-        uint8_t buf[1];
-        buf[0] = s->htif_tohost & 0xff;
-        s->common.console->write_data(s->common.console->opaque, buf, 1);
+        //uint8_t buf[1];
+        //buf[0] = s->htif_tohost & 0xff;
+        //s->common.console->write_data(s->common.console->opaque, buf, 1);
         s->htif_tohost = 0;
         s->htif_fromhost = ((uint64_t)device << 56) | ((uint64_t)cmd << 48);
     } else if (device == 1 && cmd == 0) {
@@ -826,6 +834,15 @@ static void riscv_machine_set_defaults(VirtMachineParams *p)
 {
 }
 
+static void riscv_virt_machine_resume(VirtMachine *s1)
+{
+    RISCVMachine *s = (RISCVMachine *)s1;
+    if (s->rtc_real_time) {
+      s->rtc_start_time = rtc_get_real_time(s);
+      needs_adjust_real_time = TRUE;
+    }
+}
+
 static VirtMachine *riscv_machine_init(const VirtMachineParams *p)
 {
     RISCVMachine *s;
@@ -1050,4 +1067,5 @@ const VirtMachineClass riscv_machine_class = {
     riscv_vm_mouse_is_absolute,
     riscv_vm_send_mouse_event,
     riscv_vm_send_key_event,
+    riscv_virt_machine_resume,
 };
